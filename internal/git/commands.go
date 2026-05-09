@@ -132,21 +132,36 @@ type catFileBatch struct {
 	Truncated           bool
 }
 
-func CatFileBatch(user string, gist string, revision string, truncate bool) ([]*catFileBatch, error) {
+func CatFileBatch(user string, gist string, revision string, truncate bool) ([]*catFileBatch, bool, error) {
 	repositoryPath := RepositoryPath(user, gist)
+	maxFiles := 50
 
 	lsTreeCmd := exec.Command("git", "ls-tree", "-l", revision)
 	lsTreeCmd.Dir = repositoryPath
-	lsTreeOutput, err := lsTreeCmd.Output()
+
+	var lsTreeStderr bytes.Buffer
+	lsTreeCmd.Stderr = &lsTreeStderr
+
+	lsTreeStdout, err := lsTreeCmd.StdoutPipe()
 	if err != nil {
-		return nil, err
+		return nil, false, err
+	}
+	if err = lsTreeCmd.Start(); err != nil {
+		return nil, false, err
 	}
 
 	fileMap := make([]*catFileBatch, 0)
+	gistTruncated := false
 
-	lines := strings.Split(string(lsTreeOutput), "\n")
-	for _, line := range lines {
-		fields := strings.Fields(line)
+	scanner := bufio.NewScanner(lsTreeStdout)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		if truncate && len(fileMap) >= maxFiles {
+			gistTruncated = true
+			break
+		}
+
+		fields := strings.Fields(scanner.Text())
 		if len(fields) < 4 {
 			continue // Skip lines that don't have enough fields
 		}
@@ -164,19 +179,33 @@ func CatFileBatch(user string, gist string, revision string, truncate bool) ([]*
 			Name: convertOctalToUTF8(name),
 		})
 	}
+	scanErr := scanner.Err()
+
+	// Closing the read end before git is done writing causes git's next write
+	// to fail (SIGPIPE on Unix, broken-pipe error on Windows). That shows up as
+	// a non-zero exit from Wait, but it's expected when we stop early — so we
+	// only treat the Wait error as real if git actually printed something to stderr.
+	_ = lsTreeStdout.Close()
+	waitErr := lsTreeCmd.Wait()
+	if scanErr != nil {
+		return nil, false, scanErr
+	}
+	if waitErr != nil && lsTreeStderr.Len() > 0 {
+		return nil, false, waitErr
+	}
 
 	catFileCmd := exec.Command("git", "cat-file", "--batch")
 	catFileCmd.Dir = repositoryPath
 	stdin, err := catFileCmd.StdinPipe()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	stdout, err := catFileCmd.StdoutPipe()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if err = catFileCmd.Start(); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	reader := bufio.NewReader(stdout)
@@ -184,12 +213,12 @@ func CatFileBatch(user string, gist string, revision string, truncate bool) ([]*
 	for _, file := range fileMap {
 		_, err = stdin.Write([]byte(file.Hash + "\n"))
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 
 		header, err := reader.ReadString('\n')
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 
 		parts := strings.Fields(header)
@@ -199,7 +228,7 @@ func CatFileBatch(user string, gist string, revision string, truncate bool) ([]*
 
 		size, err := strconv.ParseUint(parts[2], 10, 64)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 
 		// Don't truncate Jupyter notebooks
@@ -215,7 +244,7 @@ func CatFileBatch(user string, gist string, revision string, truncate bool) ([]*
 		// Read exactly size bytes from header, or the max allowed if truncated
 		content := make([]byte, sizeToRead)
 		if _, err = io.ReadFull(reader, content); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 
 		file.Content = string(content)
@@ -223,26 +252,26 @@ func CatFileBatch(user string, gist string, revision string, truncate bool) ([]*
 		if truncate && size > truncateLimit {
 			// skip other bytes if truncated
 			if _, err = reader.Discard(int(size - truncateLimit)); err != nil {
-				return nil, err
+				return nil, false, err
 			}
 			file.Truncated = true
 		}
 
 		// Read the blank line following the content
 		if _, err := reader.ReadByte(); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 	}
 
 	if err = stdin.Close(); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	if err = catFileCmd.Wait(); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
-	return fileMap, nil
+	return fileMap, gistTruncated, nil
 }
 
 func GetFileContent(user string, gist string, revision string, filename string, truncate bool) (string, bool, error) {
